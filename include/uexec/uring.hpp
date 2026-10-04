@@ -2,7 +2,8 @@
 
 #include <utility>
 
-#include <arpa/inet.h>
+#include <sys/signalfd.h>
+#include <sys/poll.h>
 
 #include <liburing.h>
 
@@ -10,6 +11,7 @@
 #include <uexec/system_error.hpp>
 
 #include <execution.hpp>
+
 namespace uexec {
 
 class operation_base {
@@ -41,7 +43,6 @@ public:
 				, _target(target) {}
 
 			void operator()() noexcept {
-				std::println("cancel!");
 				io_uring_sqe* sqe = io_uring_get_sqe(_uring);
 				if (sqe) {
 					// Возможные сценарии отмены операции:
@@ -84,7 +85,6 @@ public:
 				_func(sqe);
 				io_uring_sqe_set_data(sqe, static_cast<operation_base*>(this));
 				_stop.emplace(token, cancel_operation(_uring, this));
-				std::println("connect started");
 				return;
 			}
 
@@ -92,6 +92,7 @@ public:
 		}
 
 		void complete(io_uring_cqe* cqe) noexcept {
+			_stop.reset();
 			stdexec::set_value(std::move(_rcvr), cqe);
 		}
 
@@ -190,12 +191,56 @@ public:
 	uring& operator=(uring&&) = delete;
 
 	~uring() {
-		_scope.request_stop();
-		_scope.close();
 		io_uring_queue_exit(&_uring);
 	}
 
 public:
+	scheduler get_scheduler() noexcept {
+		return scheduler(*this);
+	}
+
+	class join_receiver {
+	public:
+		using receiver_concept = stdexec::receiver_tag;
+
+		join_receiver(scheduler sched, bool& done) noexcept
+			: _sched(sched)
+			, _done(&done) {}
+
+		void set_value() noexcept { *_done = true; }
+
+		template <class E>
+		void set_error(E&&) noexcept { *_done = true; }
+
+		void set_stopped() && noexcept { *_done = true; }
+
+		auto get_env() const noexcept {
+			return stdexec::env{
+				stdexec::prop{stdexec::get_start_scheduler, _sched}
+			};
+		}
+
+	private:
+		scheduler _sched;
+		bool* _done;
+	};
+
+	void request_stop() {
+		_scope.request_stop();
+		_scope.close();
+		_stop_requested = true;
+	}
+
+	void run_until_stopped() {
+		run_until([this] { return _stop_requested; });
+
+		bool done = false;
+		auto op = ex::connect(_scope.join(), join_receiver(get_scheduler(), done));
+		ex::start(op);
+
+		run_until([&done] { return done; });
+	}
+
 	template <typename Pred>
 	void run_until(Pred&& done) {
 		while (not std::invoke(done)) {
@@ -233,15 +278,43 @@ public:
 public:
 	auto connect(int fd, sockaddr_in addr) {
 		return submission_sender(&_uring,
-			[fd, addr](io_uring_sqe* sqe) {
+			[fd, addr](io_uring_sqe* sqe) noexcept {
 				io_uring_prep_connect(sqe, fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
 			}
 		);
 	}
 
+	auto poll_add(int fd, unsigned int mask) {
+		return submission_sender(&_uring,
+			[fd, mask](io_uring_sqe* sqe) noexcept {
+				io_uring_prep_poll_add(sqe, fd, mask);
+			}
+		);
+	}
+
+public:
+	auto handle_signal(int signal) {
+		sigset_t mask{};
+		sigemptyset(&mask);
+		sigaddset(&mask, signal);
+		if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
+			perror("sigprocmask");
+			//return 1;
+		}
+
+		int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
+		if (sfd < 0) {
+			perror("signalfd");
+			//return 1;
+		}
+
+		return poll_add(sfd, POLLIN);
+	}
+
 private:
 	io_uring _uring{};
 	size_t _entries;
+	bool _stop_requested = false;
 	ex::counting_scope _scope;
 };
 
