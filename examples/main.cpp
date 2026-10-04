@@ -1,4 +1,6 @@
 #include <print>
+#include <thread>
+#include <csignal>
 
 #include <sys/socket.h>
 #include <netinet/ip.h>
@@ -8,6 +10,12 @@
 
 #include <uexec/uring.hpp>
 
+volatile bool g_exit_requested = false;
+
+void handle_signal(int) noexcept {
+	g_exit_requested = true;
+}
+
 int main() {
 	int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sock == -1) {
@@ -16,16 +24,37 @@ int main() {
 	}
 
 	sockaddr_in addr{};
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_LOOPBACK;
-	addr.sin_port = htons(8888);
+	addr.sin_family      = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port        = htons(8888);
 
 	uexec::uring uring(2048);
 
-	ex::run_loop loop;
-	auto chain =
-		ex::schedule(loop.get_scheduler()) |
-		uexec::connect(sock, addr) |
+	std::signal(SIGINT, handle_signal);
+
+	uring.spawn(
+		uring.connect(sock, addr) |
+		ex::then([](io_uring_cqe* cqe) {
+			if (cqe->res >= 0) {
+				std::println("socket connected");
+			} else {
+				std::println("connect failed: {}", uexec::system_error(-cqe->res).message());
+			}
+		}) |
+		ex::upon_stopped([] {
+			std::println("connect cancelled");
+		}) |
+		ex::upon_error([](auto err) noexcept {
+			if constexpr (std::is_same_v<std::error_code, decltype(err)>) {
+				std::println("connect failed in core: {}", err.message());
+			}
+		})
+	);
+
+	uring.run_until([] {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		return g_exit_requested;
+	});
 
 	return 0;
 }
