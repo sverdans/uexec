@@ -10,12 +10,6 @@
 
 #include <uexec/uring.hpp>
 
-volatile bool g_exit_requested = false;
-
-void handle_signal(int) noexcept {
-	g_exit_requested = true;
-}
-
 int main() {
 	int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sock == -1) {
@@ -29,8 +23,6 @@ int main() {
 	addr.sin_port        = htons(8888);
 
 	uexec::uring uring(2048);
-
-	std::signal(SIGINT, handle_signal);
 
 	uring.spawn(
 		uring.connect(sock, addr) |
@@ -51,10 +43,27 @@ int main() {
 		})
 	);
 
-	uring.run_until([] {
-		std::this_thread::sleep_for(std::chrono::seconds(1));
-		return g_exit_requested;
-	});
+	uring.spawn(
+		uring.handle_signal(SIGINT) |
+		ex::then([&uring](io_uring_cqe* cqe) {
+			if (cqe->res >= 0) {
+				std::println("handle_signal");
+				uring.request_stop();
+			} else {
+				std::println("handle_signal failed: {}", uexec::system_error(-cqe->res).message());
+			}
+		}) |
+		ex::upon_stopped([] {
+			std::println("handle_signal cancelled");
+		}) |
+		ex::upon_error([](auto err) noexcept {
+			if constexpr (std::is_same_v<std::error_code, decltype(err)>) {
+				std::println("handle_signal failed in core: {}", err.message());
+			}
+		})
+	);
+
+	uring.run_until_stopped();
 
 	return 0;
 }
