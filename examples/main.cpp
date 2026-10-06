@@ -26,35 +26,24 @@ int main() {
 
 	uring.spawn(
 		uring.connect(sock, addr) |
-		ex::then([](io_uring_cqe* cqe) {
-			if (cqe->res >= 0) {
-				std::println("socket connected");
-			} else {
-				std::println("connect failed: {}", uexec::system_error(-cqe->res).message());
-			}
+		ex::then([] {
+			std::println("socket connected");
 		}) |
 		ex::upon_stopped([] {
 			std::println("connect cancelled");
 		}) |
 		ex::upon_error([](auto err) noexcept {
 			if constexpr (std::is_same_v<std::error_code, decltype(err)>) {
-				std::println("connect failed in core: {}", err.message());
+				std::println("connect failed: {}", err.message());
 			}
 		})
 	);
 
 	uring.spawn(
-		uring.handle_signal(SIGINT) |
-		ex::then([&uring](io_uring_cqe* cqe) {
-			if (cqe->res >= 0) {
-				std::println("handle_signal");
-				uring.request_stop();
-			} else {
-				std::println("handle_signal failed: {}", uexec::system_error(-cqe->res).message());
-			}
-		}) |
-		ex::upon_stopped([] {
-			std::println("handle_signal cancelled");
+		uring.receive_signal(SIGINT) |
+		ex::then([&uring]() {
+			std::println("SIGINT received");
+			uring.request_stop();
 		}) |
 		ex::upon_error([](auto err) noexcept {
 			if constexpr (std::is_same_v<std::error_code, decltype(err)>) {
