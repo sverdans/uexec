@@ -19,18 +19,34 @@ public:
 	virtual void complete(io_uring_cqe* cqe) noexcept = 0;
 };
 
-template <typename Func>
+template <typename T>
+struct operation_completion_signatures {
+	using type = ex::completion_signatures<
+		ex::set_value_t(T),
+		ex::set_error_t(std::error_code),
+		ex::set_stopped_t()
+	>;
+};
+
+template <>
+struct operation_completion_signatures<void> {
+	using type = ex::completion_signatures<
+		ex::set_value_t(),
+		ex::set_error_t(std::error_code),
+		ex::set_stopped_t()
+	>;
+};
+
+template <typename Operation>
 class submission_sender {
 public:
 	using sender_concept = ex::sender_tag;
 
 	template <class Self, class Env>
 	static consteval auto get_completion_signatures() noexcept {
-		return ex::completion_signatures<
-			ex::set_value_t(io_uring_cqe*),
-			ex::set_error_t(std::error_code),
-			ex::set_stopped_t()
-		>{};
+		using value_t = typename Operation::value_type;
+		using signature_t = typename operation_completion_signatures<value_t>::type;
+		return signature_t{};
 	}
 
 	template <typename Receiver>
@@ -67,10 +83,10 @@ public:
 		using stop_callback_t = typename stop_token_t::template callback_type<cancel_operation>;
 
 	public:
-		operation_state(io_uring* uring, Receiver rcvr, Func func)
+		operation_state(io_uring* uring, Operation operation, Receiver rcvr)
 			: _uring(uring)
-			, _rcvr(rcvr)
-			, _func(func) {}
+			, _operation(operation)
+			, _rcvr(rcvr) {}
 
 		void start() noexcept {
 			auto env = ex::get_env(_rcvr);
@@ -82,7 +98,7 @@ public:
 
 			io_uring_sqe* sqe = io_uring_get_sqe(_uring);
 			if (sqe) {
-				_func(sqe);
+				_operation.prepare(sqe);
 				io_uring_sqe_set_data(sqe, static_cast<operation_base*>(this));
 				_stop.emplace(token, cancel_operation(_uring, this));
 				return;
@@ -93,7 +109,7 @@ public:
 
 		void complete(io_uring_cqe* cqe) noexcept {
 			_stop.reset();
-			stdexec::set_value(std::move(_rcvr), cqe);
+			_operation.complete(std::move(_rcvr), cqe);
 		}
 
 	private:
@@ -101,24 +117,64 @@ public:
 	// - noexcept _func
 	// - вывод типов и forwarding в конструкторах
 		io_uring* _uring;
+		Operation _operation;
 		Receiver _rcvr;
-		Func _func;
 		std::optional<stop_callback_t> _stop;
 	};
 
 public:
-	submission_sender(io_uring* uring, Func&& func)
+	submission_sender(io_uring* uring, Operation&& operation)
 		: _uring(uring)
-		, _func(std::forward<Func>(func)) {}
+		, _operation(std::forward<Operation>(operation)) {}
 
 	template <ex::receiver Receiver>
 	auto connect(Receiver rcvr) noexcept {
-		return operation_state<Receiver>(_uring, std::move(rcvr), std::move(_func));
+		return operation_state<Receiver>(_uring, std::move(_operation), std::move(rcvr));
 	}
 
 private:
 	io_uring* _uring;
-	Func _func;
+	Operation _operation;
+};
+
+struct connect_operation {
+	using value_type = void;
+
+	void prepare(io_uring_sqe* sqe) noexcept {
+		io_uring_prep_connect(sqe, fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+	}
+
+	template <ex::receiver Receiver>
+	void complete(Receiver&& rcvr, io_uring_cqe* cqe) noexcept {
+		if (cqe->res >= 0) {
+			ex::set_value(std::move(rcvr));
+		} else {
+			ex::set_error(std::move(rcvr), system_error(-cqe->res));
+		}
+	}
+
+	int fd;
+	sockaddr_in addr;
+};
+
+struct poll_add_operation {
+	using value_type = void;
+
+	void prepare(io_uring_sqe* sqe) noexcept {
+		io_uring_prep_poll_add(sqe, fd, mask);
+	}
+
+	template <ex::receiver Receiver>
+	void complete(Receiver&& rcvr, io_uring_cqe* cqe) noexcept {
+		if (cqe->res >= 0) {
+			ex::set_value(std::move(rcvr));
+		} else {
+			ex::set_error(std::move(rcvr), system_error(-cqe->res));
+		}
+	}
+
+	int fd;
+	unsigned int mask;
 };
 
 class uring final {
@@ -226,9 +282,11 @@ public:
 	};
 
 	void request_stop() {
-		_scope.request_stop();
-		_scope.close();
-		_stop_requested = true;
+		if (not _stop_requested) {
+			_stop_requested = true;
+			_scope.request_stop();
+			_scope.close();
+		}
 	}
 
 	void run_until_stopped() {
@@ -277,23 +335,15 @@ public:
 
 public:
 	auto connect(int fd, sockaddr_in addr) {
-		return submission_sender(&_uring,
-			[fd, addr](io_uring_sqe* sqe) noexcept {
-				io_uring_prep_connect(sqe, fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
-			}
-		);
+		return submission_sender(&_uring, connect_operation{fd, addr});
 	}
 
 	auto poll_add(int fd, unsigned int mask) {
-		return submission_sender(&_uring,
-			[fd, mask](io_uring_sqe* sqe) noexcept {
-				io_uring_prep_poll_add(sqe, fd, mask);
-			}
-		);
+		return submission_sender(&_uring, poll_add_operation{fd, mask});
 	}
 
 public:
-	auto handle_signal(int signal) {
+	auto receive_signal(int signal) {
 		sigset_t mask{};
 		sigemptyset(&mask);
 		sigaddset(&mask, signal);
