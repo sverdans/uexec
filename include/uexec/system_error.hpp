@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <system_error>
+#include <format>
 
 namespace uexec {
 
@@ -16,3 +17,22 @@ inline void throw_system_error_if(bool condition, int err = errno) {
 }
 
 } // namespace uexec
+
+template <>
+struct std::formatter<std::error_code> {
+	template <class ParseContext>
+	constexpr auto parse(ParseContext& ctx) {
+		return ctx.begin();
+	}
+
+	template <class FormatContext>
+	auto format(std::error_code err, FormatContext& ctx) const {
+		return std::format_to(
+			ctx.out(),
+			"{}:{}({})",
+			err.category().name(),
+			err.value(),
+			err.message()
+		);
+	}
+};
