@@ -9,6 +9,8 @@
 
 #include <uexec/types.hpp>
 #include <uexec/system_error.hpp>
+#include <uexec/detail/flag_receiver.hpp>
+#include <uexec/exception_policy.hpp>
 
 #include <execution.hpp>
 
@@ -38,7 +40,7 @@ struct operation_completion_signatures<void> {
 };
 
 template <typename Operation>
-class submission_sender {
+class uring_sender {
 public:
 	using sender_concept = ex::sender_tag;
 
@@ -91,13 +93,13 @@ public:
 		void start() noexcept {
 			auto env = ex::get_env(_rcvr);
 			ex::stoppable_token auto token = ex::get_stop_token(env);
-			if (token.stop_requested()) {
+			if (token.stop_requested()) [[unlikely]] {
 				ex::set_stopped(std::move(_rcvr));
 				return;
 			}
 
 			io_uring_sqe* sqe = io_uring_get_sqe(_uring);
-			if (sqe) {
+			if (sqe) [[likely]] {
 				_operation.prepare(sqe);
 				io_uring_sqe_set_data(sqe, static_cast<operation_base*>(this));
 				_stop.emplace(token, cancel_operation(_uring, this));
@@ -109,7 +111,11 @@ public:
 
 		void complete(io_uring_cqe* cqe) noexcept {
 			_stop.reset();
-			_operation.complete(std::move(_rcvr), cqe);
+			if (cqe->res != -ECANCELED) [[likely]] {
+				_operation.complete(std::move(_rcvr), cqe);
+			} else {
+				ex::set_stopped(std::move(_rcvr));
+			}
 		}
 
 	private:
@@ -123,7 +129,7 @@ public:
 	};
 
 public:
-	submission_sender(io_uring* uring, Operation&& operation)
+	uring_sender(io_uring* uring, Operation&& operation)
 		: _uring(uring)
 		, _operation(std::forward<Operation>(operation)) {}
 
@@ -189,7 +195,7 @@ public:
 				, _rcvr(std::move(rcvr)) {}
 
 			void start() noexcept {
-				stdexec::set_value(std::move(_rcvr));
+				ex::set_value(std::move(_rcvr));
 			}
 
 		private:
@@ -199,11 +205,11 @@ public:
 
 		class schedule_sender {
 		public:
-			using sender_concept = stdexec::sender_tag;
+			using sender_concept = ex::sender_tag;
 
 			template <class Self, class Env>
 			static consteval auto get_completion_signatures() noexcept {
-				return stdexec::completion_signatures<stdexec::set_value_t()>{};
+				return ex::completion_signatures<ex::set_value_t()>{};
 			}
 
 			explicit schedule_sender(uring& ctx) noexcept
@@ -255,32 +261,6 @@ public:
 		return scheduler(*this);
 	}
 
-	class join_receiver {
-	public:
-		using receiver_concept = stdexec::receiver_tag;
-
-		join_receiver(scheduler sched, bool& done) noexcept
-			: _sched(sched)
-			, _done(&done) {}
-
-		void set_value() noexcept { *_done = true; }
-
-		template <class E>
-		void set_error(E&&) noexcept { *_done = true; }
-
-		void set_stopped() && noexcept { *_done = true; }
-
-		auto get_env() const noexcept {
-			return stdexec::env{
-				stdexec::prop{stdexec::get_start_scheduler, _sched}
-			};
-		}
-
-	private:
-		scheduler _sched;
-		bool* _done;
-	};
-
 	void request_stop() {
 		if (not _stop_requested) {
 			_stop_requested = true;
@@ -293,7 +273,7 @@ public:
 		run_until([this] { return _stop_requested; });
 
 		bool done = false;
-		auto op = ex::connect(_scope.join(), join_receiver(get_scheduler(), done));
+		auto op = ex::connect(_scope.join(), detail::flag_receiver(get_scheduler(), done));
 		ex::start(op);
 
 		run_until([&done] { return done; });
@@ -328,37 +308,55 @@ public:
 	}
 
 public:
-	template <ex::sender Sender>
+	template <exception_policy POLICY = exception_policy::standard, ex::sender Sender>
 	void spawn(Sender&& sndr) {
-		stdexec::spawn(std::forward<Sender>(sndr), _scope.get_token());
+		if constexpr (POLICY == exception_policy::abort) {
+			ex::spawn(
+				with_abort_on_exception(
+					ex::starts_on(get_scheduler(), std::move(sndr))
+				),
+				_scope.get_token()
+			);
+		} else {
+			ex::spawn(
+				ex::starts_on(get_scheduler(), std::move(sndr)),
+				_scope.get_token()
+			);
+		}
+	}
+
+	template <exception_policy Policy = exception_policy::standard, class Factory>
+	requires std::invocable<Factory> && ex::sender<std::invoke_result_t<Factory>>
+	void spawn(Factory&& factory) {
+		spawn<Policy>(std::invoke(std::forward<Factory>(factory)));
 	}
 
 public:
-	auto connect(int fd, sockaddr_in addr) {
-		return submission_sender(&_uring, connect_operation{fd, addr});
+	ex::sender auto connect(int fd, sockaddr_in addr) noexcept {
+		return uring_sender(&_uring, connect_operation{fd, addr});
 	}
 
-	auto poll_add(int fd, unsigned int mask) {
-		return submission_sender(&_uring, poll_add_operation{fd, mask});
+	ex::sender auto poll_add(int fd, unsigned int mask) noexcept {
+		return uring_sender(&_uring, poll_add_operation{fd, mask});
 	}
 
 public:
-	auto receive_signal(int signal) {
-		sigset_t mask{};
-		sigemptyset(&mask);
-		sigaddset(&mask, signal);
-		if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
-			perror("sigprocmask");
-			//return 1;
-		}
+	auto receive_signal(int signal) noexcept {
+		return ex::just() |
+			ex::then([this, signal] noexcept {
+				sigset_t mask{};
+				sigemptyset(&mask);
+				sigaddset(&mask, signal);
+				sigprocmask(SIG_BLOCK, &mask, NULL);
+				// throw_system_error_if(res != 0);
+				int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
+				// throw_system_error_if(res != 0);
 
-		int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
-		if (sfd < 0) {
-			perror("signalfd");
-			//return 1;
-		}
-
-		return poll_add(sfd, POLLIN);
+				return sfd;
+			}) |
+			ex::let_value([this](int sfd) noexcept {
+				return poll_add(sfd, POLLIN);
+			});
 	}
 
 private:
