@@ -6,5 +6,5 @@ function(add_example name)
     target_link_libraries(${name} PRIVATE uexec)
 endfunction()
 
-add_example(main)
-add_example(coro)
+add_example(connect)
+add_example(coro_connect)
