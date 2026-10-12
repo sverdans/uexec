@@ -13,6 +13,9 @@ namespace uexec {
 //   - вывод типов и forwarding в ctr
 //   - exception safety
 //   - проеврка error_type оборачиваемого сендера
+//   - зависимость expected_type от Env
+//         - template <typename Env> value_type = sender_value_t<sender_type, Env>;
+//         - template <typename Env> expected_type = std::expected<value_type<Env>, error_type>;
 
 template <ex::sender Sender>
 class as_expected_sender {

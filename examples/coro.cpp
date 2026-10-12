@@ -9,12 +9,21 @@
 #include <execution.hpp>
 
 #include <uexec/uring.hpp>
+#include <uexec/operation.hpp>
 #include <uexec/as_expected.hpp>
 
 using namespace uexec;
 
+uexec::uring* stop_me = nullptr;
+
+void handle_signal(int) {
+	stop_me->request_stop();
+}
+
 int main() {
 	uexec::uring uring(2048);
+	stop_me = &uring;
+	std::signal(SIGINT, handle_signal);
 
 	uring.spawn([&uring]() -> ex::task<> {
 		int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -28,23 +37,13 @@ int main() {
 		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		addr.sin_port        = htons(8888);
 
-		auto res = co_await as_expected(uring.connect(sock, addr));
+		auto res = co_await as_expected(uexec::connect(uring, sock, addr));
 		if (not res) {
 			std::println("connect failed: {}", res.error());
 			co_return;
 		}
 
 		std::println("socket connected");
-	});
-
-	uring.spawn<exception_policy::abort>([&uring]() -> ex::task<> {
-		auto res = co_await as_expected(uring.receive_signal(SIGINT));
-		if (not res) {
-			std::println("receive signal failed: {}", res.error());
-			co_return;
-		}
-		std::println("SIGINT received");
-		uring.request_stop();
 	});
 
 	uring.run_until_stopped();
