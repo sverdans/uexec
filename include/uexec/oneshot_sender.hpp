@@ -32,8 +32,34 @@ struct operation_completion_signatures<void> {
 	>;
 };
 
-template <typename Operation>
-class uring_sender {
+struct cancel_callback {
+public:
+	cancel_callback(uring& ctx, void* target) noexcept
+		: _ctx(ctx)
+		, _target(target) {}
+
+	void operator()() noexcept {
+		io_uring_sqe* sqe = io_uring_get_sqe(_ctx.handle());
+		if (sqe) {
+			// Возможные сценарии отмены операции:
+			// 1. сначала формируется cqe cancel_operation, cqe целевой операции вернётся с кодом ECANCEL
+			// 2. сначала формируется cqe целевой операции, cqe cancel_operation будет содержать код ошибки
+			// заключения:
+			// - невозможно продолжить граф исполнения для сценария 2, так как cancel_operation будет уничтожен;
+			// - если отмена прошла штатно, то анализировать cqe cancel_operation нет необходимости,
+			//   так как cqe целевой операции будет содержать errc ECANCEL.
+			io_uring_prep_cancel(sqe, _target, 0);
+			io_uring_sqe_set_data(sqe, nullptr);
+		}
+	}
+
+private:
+	uring& _ctx;
+	void* _target;
+};
+
+template <uring_operation Operation>
+class oneshot_sender {
 public:
 	using sender_concept = ex::sender_tag;
 
@@ -44,44 +70,18 @@ public:
 		return signature_t{};
 	}
 
-	template <typename Receiver>
+	template <ex::receiver Receiver>
 	class operation_state final : public operation_base {
 	private:
-		struct cancel_operation {
-		public:
-			cancel_operation(uring& ctx, operation_state* target) noexcept
-				: _ctx(ctx)
-				, _target(target) {}
-
-			void operator()() noexcept {
-				io_uring_sqe* sqe = io_uring_get_sqe(_ctx.handle());
-				if (sqe) {
-					// Возможные сценарии отмены операции:
-					// 1. сначала формируется cqe cancel_operation, cqe целевой операции вернётся с кодом ECANCEL
-					// 2. сначала формируется cqe целевой операции, cqe cancel_operation будет содержать код ошибки
-					// заключения:
-					// - невозможно продолжить граф исполнения для сценария 2, так как cancel_operation будет уничтожен;
-					// - если отмена прошла штатно, то анализировать cqe cancel_operation нет необходимости,
-					//   так как cqe целевой операции будет содержать errc ECANCEL.
-					io_uring_prep_cancel(sqe, _target, 0);
-					io_uring_sqe_set_data(sqe, nullptr);
-				}
-			}
-
-		private:
-			uring& _ctx;
-			operation_state* _target;
-		};
-
 		using env_t           = ex::env_of_t<Receiver>;
 		using stop_token_t    = ex::stop_token_of_t<env_t>;
-		using stop_callback_t = typename stop_token_t::template callback_type<cancel_operation>;
+		using stop_callback_t = typename stop_token_t::template callback_type<cancel_callback>;
 
 	public:
-		operation_state(uring& ctx, Operation operation, Receiver rcvr)
+		operation_state(uring& ctx, Operation&& operation, Receiver&& rcvr)
 			: _ctx(ctx)
-			, _operation(operation)
-			, _rcvr(rcvr) {}
+			, _operation(std::forward<Operation>(operation))
+			, _rcvr(std::forward<Receiver>(rcvr)) {}
 
 		void start() noexcept {
 			auto env = ex::get_env(_rcvr);
@@ -95,7 +95,7 @@ public:
 			if (sqe) [[likely]] {
 				_operation.prepare(sqe);
 				io_uring_sqe_set_data(sqe, static_cast<operation_base*>(this));
-				_stop.emplace(token, cancel_operation(_ctx, this));
+				_stop.emplace(token, cancel_callback(_ctx, this));
 				return;
 			}
 
@@ -104,10 +104,14 @@ public:
 
 		void complete(io_uring_cqe* cqe) noexcept {
 			_stop.reset();
-			if (cqe->res != -ECANCELED) [[likely]] {
+			int res = cqe->res;
+			if (res >= 0) [[likely]] {
 				_operation.complete(std::move(_rcvr), cqe);
-			} else {
+			} else if (res == -ECANCELED) {
+				// TODO: проверить что отмена была запрошена
 				ex::set_stopped(std::move(_rcvr));
+			} else {
+				ex::set_error(std::move(_rcvr), system_error(-res));
 			}
 		}
 
@@ -119,13 +123,14 @@ public:
 	};
 
 public:
-	uring_sender(uring& ctx, Operation&& operation)
+	oneshot_sender(uring& ctx, Operation&& operation)
 		: _ctx(ctx)
 		, _operation(std::forward<Operation>(operation)) {}
 
 	template <ex::receiver Receiver>
-	auto connect(Receiver rcvr) noexcept {
-		return operation_state<Receiver>(_ctx, std::move(_operation), std::move(rcvr));
+	auto connect(Receiver&& rcvr) noexcept {
+		using receiver_type = std::remove_cvref_t<Receiver>;
+		return operation_state<receiver_type>(_ctx, std::move(_operation), std::move(rcvr));
 	}
 
 private:
@@ -134,8 +139,8 @@ private:
 };
 
 template <uring_operation Operation>
-struct make_uring_sender_t {
-	using sender_type = uring_sender<Operation>;
+struct make_oneshot_sender_t {
+	using sender_type = oneshot_sender<Operation>;
 
 	template <typename... Args>
 	sender_type operator()(uring& ctx, Args&&... args) const noexcept {
@@ -156,7 +161,7 @@ struct make_uring_sender_t {
 						[&](auto&&... unpacked) noexcept {
 							return sender_type(
 								sched.context(),
-								Operation{std::forward<decltype(unpacked)>(unpacked)...}
+								Operation(std::forward<decltype(unpacked)>(unpacked)...)
 							);
 						},
 						std::move(args)
