@@ -4,14 +4,11 @@
 
 namespace uexec {
 
-// Планировщик, ассоциированный с контекстом исполнения `Context`.
+// Планировщик, ассоциированный с контекстом исполнения.
 // Операция стартует синхронно в вызывающем потоке.
-// Планировщик обогащает окружение sender'а ссылкой на контекст, благодаря
-// чему внутри цепочки можно получить `get_start_scheduler_t`.
 
 // TODO:
 // - проверить возможность остановки
-// - хорошая ли идея использовать get_start_scheduler_t?
 
 template <typename Context>
 class eager_scheduler {
@@ -22,7 +19,7 @@ public:
 	public:
 		env(Context& ctx) noexcept : _ctx(ctx) {}
 
-		auto query(ex::get_start_scheduler_t) const noexcept {
+		auto query(ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept {
 			return _ctx.get_scheduler();
 		}
 

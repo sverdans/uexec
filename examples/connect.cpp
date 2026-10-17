@@ -40,14 +40,12 @@ int main() {
 
 	uring.spawn(
 		uexec::connect(sock, addr) |
-		ex::then([] noexcept {
-			debug("socket connected");
-		}) |
 		ex::let_error([](std::error_code err) noexcept {
 			debug("connect failed: {}", err);
 			return ex::just_stopped();
 		}) |
 		ex::let_value([sock, &msg] noexcept {
+			debug("socket connected");
 			return uexec::send(sock, msg.data(), msg.size());
 		}) |
 		ex::let_error([](std::error_code err) noexcept {
