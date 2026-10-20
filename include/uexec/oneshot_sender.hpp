@@ -15,6 +15,14 @@ namespace uexec {
 // - концепты
 
 template <typename T>
+struct operation_value {
+	using type = decltype(std::declval<T>().complete(nullptr));
+};
+
+template <typename T>
+using operation_value_t = typename operation_value<T>::type;
+
+template <typename T>
 struct operation_completion_signatures {
 	using type = ex::completion_signatures<
 		ex::set_value_t(T),
@@ -62,10 +70,10 @@ template <uring_operation Operation>
 class oneshot_sender {
 public:
 	using sender_concept = ex::sender_tag;
+	using value_t = operation_value_t<Operation>;
 
 	template <class Self, class Env>
 	static consteval auto get_completion_signatures() noexcept {
-		using value_t = typename Operation::value_type;
 		using signature_t = typename operation_completion_signatures<value_t>::type;
 		return signature_t{};
 	}
@@ -106,12 +114,21 @@ public:
 			_stop.reset();
 			int res = cqe->res;
 			if (res >= 0) [[likely]] {
-				_operation.complete(std::move(_rcvr), cqe);
+				set_value(cqe);
 			} else if (res == -ECANCELED) {
-				// TODO: проверить что отмена была запрошена
-				ex::set_stopped(std::move(_rcvr));
+				ex::set_stopped(std::move(_rcvr)); // TODO: проверить что отмена была запрошена
 			} else {
 				ex::set_error(std::move(_rcvr), system_error(-res));
+			}
+		}
+
+	private:
+		void set_value(io_uring_cqe* cqe) noexcept {
+			if constexpr (std::is_same_v<value_t, void>) {
+				_operation.complete(cqe);
+				ex::set_value(std::move(_rcvr));
+			} else {
+				ex::set_value(std::move(_rcvr), _operation.complete(cqe));
 			}
 		}
 
