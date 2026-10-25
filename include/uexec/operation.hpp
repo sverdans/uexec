@@ -10,13 +10,14 @@ namespace uexec {
 
 struct connect_op {
 	void prepare(io_uring_sqe* sqe) noexcept {
-		io_uring_prep_connect(sqe, fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+		io_uring_prep_connect(sqe, fd, addr, addrlen);
 	}
 
 	void complete(io_uring_cqe*) noexcept {}
 
 	int fd;
-	sockaddr_in addr;
+	const sockaddr* addr;
+	socklen_t addrlen;
 };
 
 struct send_op {
@@ -62,7 +63,6 @@ struct recv_op {
 	size_t len;
 	int flags = 0;
 };
-
 
 constexpr inline auto connect = make_oneshot_sender_t<connect_op>();
 constexpr inline auto send    = make_oneshot_sender_t<send_op>();

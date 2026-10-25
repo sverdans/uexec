@@ -12,13 +12,31 @@
 #include <uexec/unique_fd.hpp>
 #include <uexec/operation.hpp>
 
+#define debug(...) { try { std::println(__VA_ARGS__); } catch (...) {} }
+
 uexec::uring* stop_me = nullptr;
 
 void handle_signal(int) {
 	stop_me->request_stop();
 }
 
-#define debug(...) { try { std::println(__VA_ARGS__); } catch (...) {} }
+auto connect_ipv4(int fd, uint32_t hostlong, uint16_t hostport) {
+	sockaddr_in addr{};
+	addr.sin_family      = AF_INET;
+	addr.sin_addr.s_addr = htonl(hostlong);
+	addr.sin_port        = htons(hostport);
+	return ex::just(addr) |
+		ex::let_value([fd](sockaddr_in& addr) noexcept {
+			return uexec::connect(fd, reinterpret_cast<sockaddr*>(&addr), socklen_t(sizeof(addr)));
+		});
+}
+
+auto send_message(int fd, std::string&& msg) {
+	return ex::just(std::move(msg)) |
+		ex::let_value([fd](std::string& msg) noexcept {
+			return uexec::send(fd, msg.data(), msg.size());
+		});
+}
 
 int main() {
 	uexec::unique_fd sock{socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)};
@@ -27,9 +45,7 @@ int main() {
 		return EXIT_FAILURE;
 	}
 
-	std::string msg = "hello world!";
 	std::array<uint8_t, 20> input;
-
 	uexec::uring uring(2048);
 	stop_me = &uring;
 	std::signal(SIGINT, handle_signal);
@@ -37,11 +53,7 @@ int main() {
 	uring.spawn(
 		ex::just(sock.get()) |
 		ex::let_value([](int sock) noexcept {
-			sockaddr_in addr{};
-			addr.sin_family      = AF_INET;
-			addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-			addr.sin_port        = htons(8888);
-			return uexec::connect(sock, addr);
+			return connect_ipv4(sock, INADDR_LOOPBACK, 8888);
 		}) |
 		ex::let_error([](std::error_code err) noexcept {
 			debug("connect failed: {}", err);
@@ -49,7 +61,7 @@ int main() {
 		}) |
 		ex::let_value([&] noexcept {
 			debug("socket connected");
-			return uexec::send(sock.get(), msg.data(), msg.size());
+			return send_message(sock.get(), "hello world");
 		}) |
 		ex::let_error([](std::error_code err) noexcept {
 			debug("send failed: {}", err);

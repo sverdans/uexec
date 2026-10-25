@@ -38,7 +38,13 @@ int main() {
 		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		addr.sin_port        = htons(8888);
 
-		auto res = co_await as_expected(uexec::connect(uring, sock.get(), addr));
+		auto res = co_await as_expected(uexec::connect(
+			uring,
+			sock.get(),
+			reinterpret_cast<sockaddr*>(&addr),
+			socklen_t(sizeof(addr))
+		));
+
 		if (not res) {
 			std::println("connect failed: {}", res.error());
 			co_return;
