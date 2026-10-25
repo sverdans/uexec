@@ -5,22 +5,17 @@
 #include <execution.hpp>
 
 #include <uexec/uring.hpp>
+#include <uexec/meta.hpp>
 #include <uexec/detail/operation_concept.hpp>
-
-namespace uexec {
+#include <uexec/detail/cancellation.hpp>
 
 // TODO:
 // - noexcept
 // - вывод типов и forwarding в конструкторах
 // - концепты
 
-template <typename T>
-struct operation_value {
-	using type = decltype(std::declval<T>().complete(nullptr));
-};
-
-template <typename T>
-using operation_value_t = typename operation_value<T>::type;
+namespace uexec {
+namespace detail {
 
 template <typename T>
 struct operation_completion_signatures {
@@ -40,31 +35,10 @@ struct operation_completion_signatures<void> {
 	>;
 };
 
-struct cancel_callback {
-public:
-	cancel_callback(uring& ctx, void* target) noexcept
-		: _ctx(ctx)
-		, _target(target) {}
+template <typename T>
+using operation_completion_signatures_t = typename operation_completion_signatures<T>::type;
 
-	void operator()() noexcept {
-		io_uring_sqe* sqe = io_uring_get_sqe(_ctx.handle());
-		if (sqe) {
-			// Возможные сценарии отмены операции:
-			// 1. сначала формируется cqe cancel_operation, cqe целевой операции вернётся с кодом ECANCEL
-			// 2. сначала формируется cqe целевой операции, cqe cancel_operation будет содержать код ошибки
-			// заключения:
-			// - невозможно продолжить граф исполнения для сценария 2, так как cancel_operation будет уничтожен;
-			// - если отмена прошла штатно, то анализировать cqe cancel_operation нет необходимости,
-			//   так как cqe целевой операции будет содержать errc ECANCEL.
-			io_uring_prep_cancel(sqe, _target, 0);
-			io_uring_sqe_set_data(sqe, nullptr);
-		}
-	}
-
-private:
-	uring& _ctx;
-	void* _target;
-};
+} // namespace detail
 
 template <uring_operation Operation>
 class oneshot_sender {
@@ -74,17 +48,11 @@ public:
 
 	template <class Self, class Env>
 	static consteval auto get_completion_signatures() noexcept {
-		using signature_t = typename operation_completion_signatures<value_t>::type;
-		return signature_t{};
+		return detail::operation_completion_signatures_t<value_t>{};
 	}
 
-	template <ex::receiver Receiver>
+	template <typename Receiver>
 	class operation_state final : public operation_base {
-	private:
-		using env_t           = ex::env_of_t<Receiver>;
-		using stop_token_t    = ex::stop_token_of_t<env_t>;
-		using stop_callback_t = typename stop_token_t::template callback_type<cancel_callback>;
-
 	public:
 		operation_state(uring& ctx, Operation&& operation, Receiver&& rcvr)
 			: _ctx(ctx)
@@ -103,7 +71,7 @@ public:
 			if (sqe) [[likely]] {
 				_operation.prepare(sqe);
 				io_uring_sqe_set_data(sqe, static_cast<operation_base*>(this));
-				_stop.emplace(token, cancel_callback(_ctx, this));
+				_cancellation.enable(token, _ctx, this);
 				return;
 			}
 
@@ -111,12 +79,12 @@ public:
 		}
 
 		void complete(io_uring_cqe* cqe) noexcept {
-			_stop.reset();
+			_cancellation.disable();
 			int res = cqe->res;
 			if (res >= 0) [[likely]] {
 				set_value(cqe);
-			} else if (res == -ECANCELED) {
-				ex::set_stopped(std::move(_rcvr)); // TODO: проверить что отмена была запрошена
+			} else if (_cancellation.requested() && res == -ECANCELED) {
+				ex::set_stopped(std::move(_rcvr));
 			} else {
 				ex::set_error(std::move(_rcvr), system_error(-res));
 			}
@@ -133,10 +101,11 @@ public:
 		}
 
 	private:
+		using token_t = stop_token_t<Receiver>;
 		uring& _ctx;
 		Operation _operation;
 		Receiver _rcvr;
-		std::optional<stop_callback_t> _stop;
+		detail::cancellation<token_t> _cancellation;
 	};
 
 public:

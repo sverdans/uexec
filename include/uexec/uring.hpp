@@ -9,7 +9,7 @@
 
 #include <uexec/types.hpp>
 #include <uexec/system_error.hpp>
-#include <uexec/detail/flag_receiver.hpp>
+#include <uexec/detail/join_receiver.hpp>
 #include <uexec/exception_policy.hpp>
 #include <uexec/scheduler.hpp>
 
@@ -60,11 +60,11 @@ public:
 	void run_until_stopped() {
 		run_until([this] { return _stop_requested; });
 
-		bool done = false;
-		auto op = ex::connect(_scope.join(), detail::flag_receiver(get_scheduler(), done));
+		bool joined = false;
+		auto op = ex::connect(_scope.join(), detail::join_receiver(get_scheduler(), joined));
 		ex::start(op);
 
-		run_until([&done] { return done; });
+		run_until([&joined] { return joined; });
 	}
 
 	template <typename Pred>

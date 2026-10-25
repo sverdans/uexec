@@ -9,10 +9,10 @@
 namespace uexec {
 namespace detail {
 
-template <class V>
+template <typename V>
 struct unpacked_sender_value {};
 
-template <class V>
+template <typename V>
 struct unpacked_sender_value<std::variant<std::tuple<V>>> {
 	using type = V;
 };
@@ -27,7 +27,7 @@ struct unpacked_sender_value<std::variant<std::tuple<>>> {
 template <ex::sender Sender, ex::receiver Receiver>
 using connect_type = decltype(ex::connect(std::declval<Sender>(), std::declval<Receiver>()));
 
-template <class Sender, class Env = ex::env<>>
+template <typename Sender, typename Env = ex::env<>>
 struct sender_value {
 	using type =
 		typename detail::unpacked_sender_value<
@@ -35,7 +35,10 @@ struct sender_value {
 		>::type;
 };
 
-template <class Sender, class Env = ex::env<>>
+template <typename Sender, typename Env = ex::env<>>
 using sender_value_t = sender_value<Sender, Env>::type;
+
+template <typename Receiver>
+using stop_token_t = ex::stop_token_of_t<ex::env_of_t<Receiver>>;
 
 } // namespace uexec

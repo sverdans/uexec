@@ -1,9 +1,6 @@
 #pragma once
 
-#include <concepts>
-#include <utility>
-
-#include <execution.hpp>
+#include <type_traits>
 
 struct io_uring_sqe;
 struct io_uring_cqe;
@@ -26,5 +23,13 @@ template <typename Op>
 concept uring_operation =
 	has_nothrow_prepare<Op> &&
 	has_nothrow_complete<Op>;
+
+template <typename T>
+struct operation_value {
+	using type = decltype(std::declval<T>().complete(nullptr));
+};
+
+template <typename T>
+using operation_value_t = typename operation_value<T>::type;
 
 } // namespace uexec

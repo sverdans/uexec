@@ -7,9 +7,6 @@ namespace uexec {
 // Планировщик, ассоциированный с контекстом исполнения.
 // Операция стартует синхронно в вызывающем потоке.
 
-// TODO:
-// - проверить возможность остановки
-
 template <typename Context>
 class eager_scheduler {
 public:
