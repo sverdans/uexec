@@ -2,9 +2,6 @@
 
 #include <utility>
 
-#include <sys/signalfd.h>
-#include <sys/poll.h>
-
 #include <liburing.h>
 
 #include <uexec/types.hpp>

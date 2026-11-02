@@ -27,5 +27,5 @@ private:
 	bool& _joined;
 };
 
-} // namespace uexec
 } // namespace detail
+} // namespace uexec
