@@ -8,3 +8,4 @@ endfunction()
 
 add_example(connect)
 add_example(coro_connect)
+add_example(accept_loop)
