@@ -7,7 +7,6 @@
 #include <uexec/types.hpp>
 #include <uexec/system_error.hpp>
 #include <uexec/detail/join_receiver.hpp>
-#include <uexec/exception_policy.hpp>
 #include <uexec/scheduler.hpp>
 
 #include <execution.hpp>
@@ -93,27 +92,12 @@ public:
 	}
 
 public:
-	template <exception_policy POLICY = exception_policy::standard, ex::sender Sender>
+	template <ex::sender Sender>
 	void spawn(Sender&& sndr) {
-		if constexpr (POLICY == exception_policy::abort) {
-			ex::spawn(
-				with_abort_on_exception(
-					ex::starts_on(get_scheduler(), std::move(sndr))
-				),
-				_scope.get_token()
-			);
-		} else {
-			ex::spawn(
-				ex::starts_on(get_scheduler(), std::move(sndr)),
-				_scope.get_token()
-			);
-		}
-	}
-
-	template <exception_policy Policy = exception_policy::standard, class Factory>
-	requires std::invocable<Factory> && ex::sender<std::invoke_result_t<Factory>>
-	void spawn(Factory&& factory) {
-		spawn<Policy>(std::invoke(std::forward<Factory>(factory)));
+		ex::spawn(
+			ex::starts_on(get_scheduler(), std::forward<Sender>(sndr)),
+			_scope.get_token()
+		);
 	}
 
 private:
